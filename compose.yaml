@@ -1,0 +1,21 @@
+services:
+  api:
+    build: .
+    ports: ["8000:8000"]
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: monocle
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: monocle
+    volumes: [pgdata:/var/lib/postgresql]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monocle -d monocle"]
+      interval: 2s
+      retries: 15
+volumes:
+  pgdata:
