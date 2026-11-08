@@ -1,91 +1,70 @@
-import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from enum import Enum  
 
 import httpx
-from fastapi import FastAPI, HTTPException
-from sqlmodel import create_engine, Field, Session, SQLModel, col, func, select
-from sqlalchemy.dialects.postgresql import insert
+from fastapi import Depends, FastAPI, HTTPException
+from sqlmodel import Session, col, select
 
-engine = create_engine(os.environ["DATABASE_URL"])
-USER_AGENT = f"monocle/0.1 (student project; {os.environ.get('CONTACT_EMAIL', 'no-contact')})"
-
-class Posting(SQLModel, table=True):
-    __tablename__ = "postings"
-
-    id: int | None = Field(default=None, primary_key=True)
-    source: str
-    external_id: str
-    url_norm: str = Field(unique=True)
-    company: str
-    title: str
-    location: str | None = None
-    first_seen_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    last_seen_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+from app.db import get_session, init_db
+from app.ingest import run_ingest
+from app.models import Posting, Run
+from app.sources.boards import fetch_ashby, fetch_greenhouse, fetch_lever
+from app.sources.http import SourceNotFoundError
+from app.sources.simplify import fetch_simplify
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    SQLModel.metadata.create_all(engine)
+    init_db()
     yield
 
-app = FastAPI(title="monocle", lifespan=lifespan)
 
-def normalize_url(url: str) -> str:
-    parts = urlsplit(url.strip())
-    query = [
-        (k, v) 
-        for k, v in parse_qsl(parts.query)
-        if not k.startswith("utm_") and k not in {"gh_src", "source", "ref"}
-    ]
-    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"), urlencode(query), ""))
+app = FastAPI(title="Monocle", lifespan=lifespan)
+
+BOARD_FETCHERS = {"greenhouse": fetch_greenhouse, "ashby": fetch_ashby, "lever": fetch_lever}
+
+
+class Ats(str, Enum):
+    greenhouse = "greenhouse"
+    ashby = "ashby"
+    lever = "lever"
+
+
+class Level(str, Enum):
+    new_grad = "new_grad"
+    intern = "intern"
+
+def _ingest(session: Session, source: str, fetch) -> Run:
+    try:
+        return run_ingest(session, source, fetch)
+    except SourceNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Source {source!r} not found")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Source {source!r} failed to respond: {e}")
+
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-@app.post("/admin/ingest/greenhouse/{board}")
-def ingest_greenhouse(board: str):
-    response = httpx.get(f"https://boards-api.greenhouse.io/v1/boards/{board}/jobs", headers={"User-Agent": USER_AGENT}, timeout=10)
-    if response.status_code == 404:
-        raise HTTPException(status_code=response.status_code, detail=f"Greenhouse API returned {response.status_code}, no Greenhouse board found for {board!r}")
-    response.raise_for_status()
+@app.post("/admin/ingest/simplify/{level}", response_model=Run)
+def ingest_simplify(level: Level, session: Session = Depends(get_session)):
+    return _ingest(session, f"simplify_{level.value}", lambda: fetch_simplify(level.value))
 
-    now = datetime.now(timezone.utc)
-    rows = [
-        {
-            "source": "greenhouse",
-            "external_id": str(job["id"]),
-            "url_norm": normalize_url(job["absolute_url"]),
-            "company": board,
-            "title": job["title"],
-            "location": (job.get("location") or {}).get("name"),
-            "first_seen_at": now,
-            "last_seen_at": now,
-        }
-        for job in response.json().get("jobs", [])
-    ]
-    if not rows:
-        return {"fetched": 0, "new": 0}
+@app.post("/admin/ingest/{ats}/{board}", response_model=Run)
+def ingest_board(ats: Ats, board: str, session: Session = Depends(get_session)):
+    fetch = BOARD_FETCHERS.get(ats.value)
+    return _ingest(session, f"{ats.value}_{board}", lambda: fetch(board))
 
-    stmt = insert(Posting).values(rows)
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["url_norm"],
-        set_={
-            "title": stmt.excluded.title,
-            "last_seen_at": stmt.excluded.last_seen_at
-        },
-        )
-    with Session(engine) as session:
-        before = session.exec(select(func.count()).select_from(Posting)).one()
-        session.exec(stmt)
-        session.commit()
-        after = session.exec(select(func.count()).select_from(Posting)).one()
-    return {"fetched": len(rows), "new": after - before}
+@app.get("/runs", response_model=list[Run])
+def list_runs(limit: int = 20, session: Session = Depends(get_session)):
+    query = select(Run).order_by(col(Run.started_at).desc()).limit(limit)
+    return session.exec(query).all()
 
-
-@app.get("/postings")
-def list_postings(limit: int = 50):
-    with Session(engine) as session:
-        query = select(Posting).order_by(col(Posting.first_seen_at).desc()).limit(limit)
-        return session.exec(query).all()
+@app.get("/postings", response_model=list[Posting])
+def list_postings(limit: int = 50, level: Level | None = None, include_closed: bool = False, session: Session = Depends(get_session)):
+    query = select(Posting)
+    if level:
+        query = query.where(col(Posting.level) == level.value)
+    if not include_closed:
+        query = query.where(col(Posting.closed_at).is_(None))
+    return session.exec(query.order_by(col(Posting.first_seen_at).desc()).limit(limit)).all()
