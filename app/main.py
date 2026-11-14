@@ -11,6 +11,8 @@ from app.models import Posting, Run
 from app.sources.boards import fetch_ashby, fetch_greenhouse, fetch_lever
 from app.sources.http import SourceNotFoundError
 from app.sources.simplify import fetch_simplify
+from app.auth import current_user
+from app.routes import auth, me
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -19,6 +21,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Monocle", lifespan=lifespan)
+app.include_router(auth.router)
+app.include_router(me.router)
+LOGGED_IN = [Depends(current_user)]
 
 BOARD_FETCHERS = {"greenhouse": fetch_greenhouse, "ashby": fetch_ashby, "lever": fetch_lever}
 
@@ -46,21 +51,21 @@ def _ingest(session: Session, source: str, fetch) -> Run:
 def health():
     return {"status": "ok"}
 
-@app.post("/admin/ingest/simplify/{level}", response_model=Run)
+@app.post("/admin/ingest/simplify/{level}", response_model=Run, dependencies=LOGGED_IN)
 def ingest_simplify(level: Level, session: Session = Depends(get_session)):
     return _ingest(session, f"simplify_{level.value}", lambda: fetch_simplify(level.value))
 
-@app.post("/admin/ingest/{ats}/{board}", response_model=Run)
+@app.post("/admin/ingest/{ats}/{board}", response_model=Run, dependencies=LOGGED_IN)
 def ingest_board(ats: Ats, board: str, session: Session = Depends(get_session)):
     fetch = BOARD_FETCHERS.get(ats.value)
     return _ingest(session, f"{ats.value}_{board}", lambda: fetch(board))
 
-@app.get("/runs", response_model=list[Run])
+@app.get("/runs", response_model=list[Run], dependencies=LOGGED_IN)
 def list_runs(limit: int = 20, session: Session = Depends(get_session)):
     query = select(Run).order_by(col(Run.started_at).desc()).limit(limit)
     return session.exec(query).all()
 
-@app.get("/postings", response_model=list[Posting])
+@app.get("/postings", response_model=list[Posting], dependencies=LOGGED_IN)
 def list_postings(limit: int = 50, level: Level | None = None, include_closed: bool = False, session: Session = Depends(get_session)):
     query = select(Posting)
     if level:
